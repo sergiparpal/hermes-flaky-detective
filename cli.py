@@ -74,12 +74,17 @@ def handle(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _arg_or_cfg(arg_value, cfg, key, cast):
+    """A CLI override when given (not ``None``), else ``cfg[key]`` coerced via ``cast``."""
+    return cast(cfg[key]) if arg_value is None else arg_value
+
+
 def _resolve_scan_params(args, cfg):
-    window_days = args.window if args.window is not None else int(cfg["window_days"])
-    min_fails = args.min_fails if args.min_fails is not None else int(cfg["min_fails"])
-    include_errors = (args.include_errors if args.include_errors is not None
-                      else bool(cfg["include_errors"]))
-    return window_days, min_fails, include_errors
+    return (
+        _arg_or_cfg(args.window, cfg, "window_days", int),
+        _arg_or_cfg(args.min_fails, cfg, "min_fails", int),
+        _arg_or_cfg(args.include_errors, cfg, "include_errors", bool),
+    )
 
 
 def _validate_tunables(window_days: int, min_fails: int) -> None:
@@ -97,6 +102,78 @@ def _validate_tunables(window_days: int, min_fails: int) -> None:
         problems.append(f"--min-fails must be >= 1 (got {min_fails})")
     if problems:
         raise ValueError("; ".join(problems))
+
+
+def _build_scan_meta(*, window_days, min_fails, include_errors,
+                     source_schema_version, tests_examined, flaky_found) -> dict:
+    """The scan metadata block shared by the JSON dump and the human report."""
+    return {
+        "window_days": window_days, "min_fails": min_fails,
+        "include_errors": include_errors,
+        "source_schema_version": source_schema_version,
+        "tests_examined": tests_examined, "flaky_found": flaky_found,
+    }
+
+
+def _emit_report(fmt, report_scope, verdicts, meta, newly_flaky, newly_resolved) -> None:
+    """Print the scan result in the requested format (``cron`` may print nothing)."""
+    from . import domain, reporting
+
+    if fmt == "json":
+        print(reporting.render_json(verdicts, meta, newly_flaky, newly_resolved))
+    elif fmt == "cron":
+        flaky = [v for v in verdicts if v.status == domain.VERDICT_FLAKY]
+        text = reporting.render_cron(
+            report_scope, new_flaky_verdicts=flaky,
+            newly_flaky=newly_flaky, newly_resolved=newly_resolved,
+        )
+        if text:
+            print(text)
+    else:  # human
+        print(reporting.render_human(verdicts, meta))
+
+
+def _report_unavailable(exc, fmt) -> int:
+    """Report that test-history could not be read. Returns the process exit code.
+
+    For cron, stay silent on stdout (an empty tick) so the nightly job does not
+    alert every night before results are ingested; the note still goes to
+    stderr/logs. For interactive formats, surface the message and a non-zero exit.
+    """
+    if fmt == "cron":
+        print(str(exc), file=sys.stderr)
+        return 0
+    print(f"error: {exc}", file=sys.stderr)
+    return 1
+
+
+def _report_no_runs(conn, fmt, *, window_days, min_fails, include_errors,
+                    source_schema_version) -> int:
+    """Handle a reachable-but-empty window without wiping the previous snapshot.
+
+    test-history is reachable but has no runs in the window (e.g. every run has
+    aged past it). Do NOT overwrite the snapshot with an empty one: that would make
+    every previously-flaky test report as "no longer flaky" in the changes-only
+    cron and make is_flaky answer "unknown" for everything. Keep the prior
+    verdicts; record an audit row noting nothing was examined. Returns the exit code.
+    """
+    from . import reporting, storage
+
+    on_record = sum(storage.count_by_status(conn).values())
+    storage.record_scan_run(
+        conn, window_days=window_days, min_fails=min_fails, include_errors=include_errors,
+        source_schema_version=source_schema_version, tests_examined=0, flaky_found=0,
+    )
+    if fmt == "json":
+        meta = _build_scan_meta(
+            window_days=window_days, min_fails=min_fails, include_errors=include_errors,
+            source_schema_version=source_schema_version, tests_examined=0, flaky_found=0,
+        )
+        print(reporting.render_json([], meta, [], []))
+    elif fmt != "cron":  # human; cron stays silent (an empty tick)
+        print(f"No test runs in the last {window_days} day(s); "
+              f"keeping the previous verdicts ({on_record} on record).")
+    return 0
 
 
 def _cmd_scan(args) -> int:
@@ -120,41 +197,16 @@ def _cmd_scan(args) -> int:
     try:
         read = query.read_test_history(db_path, cutoff)
     except query.TestHistoryUnavailable as exc:
-        # No test-history data to scan. For cron, stay silent on stdout (an empty
-        # tick) so the nightly job does not alert every night before results are
-        # ingested; the note still goes to stderr/logs. For interactive formats,
-        # surface the message and a non-zero exit.
-        if fmt == "cron":
-            print(str(exc), file=sys.stderr)
-            return 0
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return _report_unavailable(exc, fmt)
 
     conn = storage.get_connection()
 
     if not read.rows:
-        # test-history is reachable but has no runs in the window (e.g. every run
-        # has aged past it). Do NOT overwrite the snapshot with an empty one: that
-        # would make every previously-flaky test report as "no longer flaky" in the
-        # changes-only cron and make is_flaky answer "unknown" for everything. Keep
-        # the prior verdicts; record an audit row noting nothing was examined.
-        on_record = sum(storage.count_by_status(conn).values())
-        storage.record_scan_run(
-            conn, window_days=window_days, min_fails=min_fails, include_errors=include_errors,
-            source_schema_version=read.source_schema_version, tests_examined=0, flaky_found=0,
+        return _report_no_runs(
+            conn, fmt, window_days=window_days, min_fails=min_fails,
+            include_errors=include_errors,
+            source_schema_version=read.source_schema_version,
         )
-        if fmt == "json":
-            empty_meta = {
-                "window_days": window_days, "min_fails": min_fails,
-                "include_errors": include_errors,
-                "source_schema_version": read.source_schema_version,
-                "tests_examined": 0, "flaky_found": 0,
-            }
-            print(reporting.render_json([], empty_meta, [], []))
-        elif fmt != "cron":  # human; cron stays silent (an empty tick)
-            print(f"No test runs in the last {window_days} day(s); "
-                  f"keeping the previous verdicts ({on_record} on record).")
-        return 0
 
     verdicts = detect.compute_verdicts(read.rows, now, window_days, min_fails, include_errors)
     new_flaky_keys = {v.test_key for v in verdicts if v.status == domain.VERDICT_FLAKY}
@@ -168,24 +220,12 @@ def _cmd_scan(args) -> int:
     )
 
     newly_flaky, newly_resolved = reporting.flaky_changes(prev_flaky_keys, new_flaky_keys)
-    scan_meta = {
-        "window_days": window_days, "min_fails": min_fails, "include_errors": include_errors,
-        "source_schema_version": read.source_schema_version,
-        "tests_examined": len(verdicts), "flaky_found": len(new_flaky_keys),
-    }
-
-    if fmt == "json":
-        print(reporting.render_json(verdicts, scan_meta, newly_flaky, newly_resolved))
-    elif fmt == "cron":
-        new_flaky_verdicts = [v for v in verdicts if v.status == domain.VERDICT_FLAKY]
-        text = reporting.render_cron(
-            report_scope, new_flaky_verdicts=new_flaky_verdicts,
-            newly_flaky=newly_flaky, newly_resolved=newly_resolved,
-        )
-        if text:
-            print(text)
-    else:  # human
-        print(reporting.render_human(verdicts, scan_meta))
+    meta = _build_scan_meta(
+        window_days=window_days, min_fails=min_fails, include_errors=include_errors,
+        source_schema_version=read.source_schema_version,
+        tests_examined=len(verdicts), flaky_found=len(new_flaky_keys),
+    )
+    _emit_report(fmt, report_scope, verdicts, meta, newly_flaky, newly_resolved)
     return 0
 
 
@@ -267,6 +307,12 @@ def _gateway_note() -> str:
             "(`hermes gateway install`, then `hermes gateway`).")
 
 
+def _print_manual_command(printable: str) -> None:
+    """Print the manual ``hermes cron create`` command plus the gateway note."""
+    print(f"  {printable}")
+    print(_gateway_note())
+
+
 def _install_shim() -> Path:
     """Copy the shim into ``<hermes_home>/scripts/`` with mode 0700; return its path."""
     import shutil
@@ -292,19 +338,20 @@ def _install_shim() -> Path:
 def _cmd_install_cron(args) -> int:
     """Install the nightly no-agent cron job (the only sanctioned subprocess).
 
-    Steps: (a) copy the shim into ``~/.hermes/scripts/`` (0700); (b) persist the
-    resolved options into ``config.json`` so the shim's ``scan`` uses them;
-    (c) create the job once via ``hermes cron create``. If that CLI is missing or
-    the gateway is not configured, this does **not** error — it prints the exact
-    command plus a one-line gateway note. ``--no-create`` skips step (c).
+    Steps, in execution order: (1) persist the resolved options into
+    ``config.json`` so the shim's ``scan`` uses them; (2) copy the shim into
+    ``~/.hermes/scripts/`` (0700); (3) create the job once via
+    ``hermes cron create``. If that CLI is missing or the gateway is not
+    configured, this does **not** error — it prints the exact command plus a
+    one-line gateway note. ``--no-create`` stops after step (2).
     """
     from . import config, domain
 
     cfg = config.get_config()
     schedule = args.schedule or cfg.get("schedule", domain.DEFAULT_SCHEDULE)
     deliver = args.deliver or cfg.get("deliver", domain.DEFAULT_DELIVER)
-    window_days = args.window if args.window is not None else int(cfg["window_days"])
-    min_fails = args.min_fails if args.min_fails is not None else int(cfg["min_fails"])
+    window_days = _arg_or_cfg(args.window, cfg, "window_days", int)
+    min_fails = _arg_or_cfg(args.min_fails, cfg, "min_fails", int)
 
     # Validate before persisting/installing anything, so a bad value is never
     # written into config.json nor baked into the scheduled job.
@@ -314,26 +361,25 @@ def _cmd_install_cron(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # (b) persist resolved options so the scheduled `scan` uses them.
+    # (1) persist resolved options so the scheduled `scan` uses them.
     config.write_config({
         "schedule": schedule, "deliver": deliver,
         "window_days": window_days, "min_fails": min_fails,
     })
 
-    # (a) install the shim.
+    # (2) install the shim.
     shim_dst = _install_shim()
     print(f"installed shim: {shim_dst} (mode 0700)")
 
     printable = _printable_cron_command(schedule, deliver)
 
-    # (d) honor --no-create: shim + config written; just print the command.
+    # honor --no-create: shim + config written; just print the command.
     if args.no_create:
         print("skipping job creation (--no-create). To create it later, run:")
-        print(f"  {printable}")
-        print(_gateway_note())
+        _print_manual_command(printable)
         return 0
 
-    # (c) the one sanctioned subprocess: create the job once. A cron-run session
+    # (3) the one sanctioned subprocess: create the job once. A cron-run session
     # cannot create cron jobs, so this is only ever reached from the standalone CLI.
     import subprocess
 
@@ -343,8 +389,7 @@ def _cmd_install_cron(args) -> int:
         result = subprocess.run(cron_cmd, capture_output=True, text=True)
     except (FileNotFoundError, OSError) as exc:
         print(f"could not run the hermes CLI ({exc}). To create the job, run:")
-        print(f"  {printable}")
-        print(_gateway_note())
+        _print_manual_command(printable)
         return 0
 
     if result.returncode == 0:
@@ -359,6 +404,5 @@ def _cmd_install_cron(args) -> int:
     if detail:
         print(detail)
     print("could not create the cron job automatically. To create it, run:")
-    print(f"  {printable}")
-    print(_gateway_note())
+    _print_manual_command(printable)
     return 0

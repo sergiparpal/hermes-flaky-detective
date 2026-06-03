@@ -85,23 +85,26 @@ def _coerce_config(cfg: dict) -> dict:
     out["include_errors"] = _as_bool(out.get("include_errors"), DEFAULT_CONFIG["include_errors"])
     for key in ("deliver", "schedule", "report_scope"):
         out[key] = _as_str(out.get(key), DEFAULT_CONFIG[key])
-    thp = out.get("test_history_db_path")
-    out["test_history_db_path"] = thp if (thp is None or isinstance(thp, str)) else None
+    raw_path = out.get("test_history_db_path")
+    out["test_history_db_path"] = raw_path if (raw_path is None or isinstance(raw_path, str)) else None
     return out
+
+
+def _read_raw_config() -> dict:
+    """The user's ``config.json`` as a dict, or ``{}`` if absent/unreadable/malformed."""
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def get_config() -> dict:
     """User ``config.json`` merged over :data:`DEFAULT_CONFIG` (defaults on error)."""
-    path = config_path()
-    user_cfg: dict = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                user_cfg = loaded
-        except Exception:
-            user_cfg = {}
-    return _coerce_config({**DEFAULT_CONFIG, **user_cfg})
+    return _coerce_config({**DEFAULT_CONFIG, **_read_raw_config()})
 
 
 def write_config(updates: dict) -> dict:
@@ -113,15 +116,7 @@ def write_config(updates: dict) -> dict:
     uses them.
     """
     path = config_path()
-    existing: dict = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            existing = {}
-    merged = {**existing, **updates}
+    merged = {**_read_raw_config(), **updates}
     path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(path, 0o600)

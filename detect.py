@@ -86,9 +86,9 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
 
     for classname, name, file_path, status, eff_ts in rows:
         key = domain.make_test_key(classname, name)
-        a = acc.get(key)
-        if a is None:
-            a = {
+        agg = acc.get(key)
+        if agg is None:
+            agg = {
                 "classname": classname,
                 "name": name,
                 "file_path": file_path,
@@ -103,36 +103,36 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
                 "last": None,        # latest eff_ts of a counted run
                 "last_fail": None,   # latest eff_ts of a counted failure
             }
-            acc[key] = a
+            acc[key] = agg
             order.append(key)
-        elif not a["file_path"] and file_path:
+        elif not agg["file_path"] and file_path:
             # Some emitters (e.g. jest) omit file_path on some rows; keep the
             # first non-null one we see so reporting can still point at a file.
-            a["file_path"] = file_path
+            agg["file_path"] = file_path
 
         counted = False
         is_fail = False
         if status == domain.STATUS_PASSED:
-            a["passes"] += 1
+            agg["passes"] += 1
             counted = True
         elif status in fail_set:
-            a["fails"] += 1
+            agg["fails"] += 1
             counted = True
             is_fail = True
         # else: skipped / uncounted-error / unknown -> ignored (not a run)
 
         if counted and eff_ts:
-            if a["first"] is None or eff_ts < a["first"]:
-                a["first"] = eff_ts
-            if a["last"] is None or eff_ts > a["last"]:
-                a["last"] = eff_ts
-            if is_fail and (a["last_fail"] is None or eff_ts > a["last_fail"]):
-                a["last_fail"] = eff_ts
+            if agg["first"] is None or eff_ts < agg["first"]:
+                agg["first"] = eff_ts
+            if agg["last"] is None or eff_ts > agg["last"]:
+                agg["last"] = eff_ts
+            if is_fail and (agg["last_fail"] is None or eff_ts > agg["last_fail"]):
+                agg["last_fail"] = eff_ts
 
     verdicts: list[Verdict] = []
     for key in order:
-        a = acc[key]
-        passes, fails = a["passes"], a["fails"]
+        agg = acc[key]
+        passes, fails = agg["passes"], agg["fails"]
         runs = passes + fails
         if fails >= min_fails and passes >= 1:
             status = domain.VERDICT_FLAKY
@@ -144,16 +144,16 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
         verdicts.append(
             Verdict(
                 test_key=key,
-                classname=a["classname"],
-                name=a["name"],
-                file_path=a["file_path"],
+                classname=agg["classname"],
+                name=agg["name"],
+                file_path=agg["file_path"],
                 passes=passes,
                 fails=fails,
                 runs=runs,
                 window_days=window_days,
-                first_seen=a["first"],
-                last_seen=a["last"],
-                last_failure=a["last_fail"],
+                first_seen=agg["first"],
+                last_seen=agg["last"],
+                last_failure=agg["last_fail"],
                 status=status,
             )
         )

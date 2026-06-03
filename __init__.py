@@ -146,15 +146,20 @@ def _lookup(conn, test_id: str) -> dict:
     return out
 
 
+def _error_json(error: str, remediation: str) -> str:
+    """A failure tool-response as a JSON string (the tool's error contract)."""
+    return json.dumps(
+        {"success": False, "error": error, "remediation": remediation},
+        ensure_ascii=False,
+    )
+
+
 def _handle_is_flaky(params, **kwargs):
     """``is_flaky`` tool handler. Returns a JSON string (the tool contract)."""
     try:
         test_id = _validate_test_id(params.get("test_id"))
     except ValueError as exc:
-        return json.dumps(
-            {"success": False, "error": str(exc), "remediation": _INPUT_REMEDIATION},
-            ensure_ascii=False,
-        )
+        return _error_json(str(exc), _INPUT_REMEDIATION)
 
     from . import storage
 
@@ -162,10 +167,7 @@ def _handle_is_flaky(params, **kwargs):
         conn = storage.get_connection()
     except Exception:  # noqa: BLE001 — setup failure: server-side, not the model's
         logger.exception("is_flaky: could not open the verdicts database")
-        return json.dumps(
-            {"success": False, "error": _INTERNAL_ERROR, "remediation": _REMEDIATION},
-            ensure_ascii=False,
-        )
+        return _error_json(_INTERNAL_ERROR, _REMEDIATION)
 
     try:
         result = _lookup(conn, test_id)
@@ -175,10 +177,7 @@ def _handle_is_flaky(params, **kwargs):
         )
     except Exception:  # noqa: BLE001 — log internally, return a generic message
         logger.exception("is_flaky failed")
-        return json.dumps(
-            {"success": False, "error": _INTERNAL_ERROR, "remediation": _REMEDIATION},
-            ensure_ascii=False,
-        )
+        return _error_json(_INTERNAL_ERROR, _REMEDIATION)
 
 
 # ---------------------------------------------------------------------------
