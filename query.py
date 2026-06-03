@@ -129,10 +129,22 @@ def _warn_on_schema_mismatch(version: int | None) -> None:
 
 
 def _normalize_rows(raw_rows) -> list[tuple]:
-    """Canonicalize each row's eff_ts so the pure core can compare as strings."""
+    """Canonicalize each row's eff_ts so the pure core can compare as strings.
+
+    All cases of one logical run share a single eff_ts, so the raw value repeats
+    far more often than it varies (a busy window has thousands of cases but only
+    a handful of distinct timestamps). Memoize the normalization per call — a
+    *local* cache, not a module-level one, so it cannot grow unbounded in the
+    long-lived gateway process.
+    """
     out: list[tuple] = []
+    cache: dict = {}
     for classname, name, file_path, status, eff_ts in raw_rows:
-        ts = timeutil.normalize_ts(eff_ts) or eff_ts
+        if eff_ts in cache:
+            ts = cache[eff_ts]
+        else:
+            ts = timeutil.normalize_ts(eff_ts) or eff_ts
+            cache[eff_ts] = ts
         out.append((classname, name, file_path, status, ts))
     return out
 

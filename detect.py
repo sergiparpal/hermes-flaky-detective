@@ -94,8 +94,14 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
                 "file_path": file_path,
                 "passes": 0,
                 "fails": 0,
-                "timestamps": [],       # eff_ts of counted runs (pass or fail)
-                "fail_timestamps": [],  # eff_ts of counted failures only
+                # Running min/max instead of full timestamp lists: the verdict only
+                # needs the earliest/latest counted run and the latest failure, so we
+                # fold them in as we go. eff_ts is canonical (sortable as a string),
+                # so a lexical compare is also a chronological one. This keeps peak
+                # memory at O(distinct tests), not O(total counted runs).
+                "first": None,       # earliest eff_ts of a counted run (pass or fail)
+                "last": None,        # latest eff_ts of a counted run
+                "last_fail": None,   # latest eff_ts of a counted failure
             }
             acc[key] = a
             order.append(key)
@@ -105,18 +111,23 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
             a["file_path"] = file_path
 
         counted = False
+        is_fail = False
         if status == domain.STATUS_PASSED:
             a["passes"] += 1
             counted = True
         elif status in fail_set:
             a["fails"] += 1
             counted = True
-            if eff_ts:
-                a["fail_timestamps"].append(eff_ts)
+            is_fail = True
         # else: skipped / uncounted-error / unknown -> ignored (not a run)
 
         if counted and eff_ts:
-            a["timestamps"].append(eff_ts)
+            if a["first"] is None or eff_ts < a["first"]:
+                a["first"] = eff_ts
+            if a["last"] is None or eff_ts > a["last"]:
+                a["last"] = eff_ts
+            if is_fail and (a["last_fail"] is None or eff_ts > a["last_fail"]):
+                a["last_fail"] = eff_ts
 
     verdicts: list[Verdict] = []
     for key in order:
@@ -130,8 +141,6 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
         else:
             status = domain.VERDICT_STABLE
 
-        ts = a["timestamps"]
-        fts = a["fail_timestamps"]
         verdicts.append(
             Verdict(
                 test_key=key,
@@ -142,9 +151,9 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
                 fails=fails,
                 runs=runs,
                 window_days=window_days,
-                first_seen=min(ts) if ts else None,
-                last_seen=max(ts) if ts else None,
-                last_failure=max(fts) if fts else None,
+                first_seen=a["first"],
+                last_seen=a["last"],
+                last_failure=a["last_fail"],
                 status=status,
             )
         )

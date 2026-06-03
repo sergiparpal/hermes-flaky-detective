@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS flaky_verdicts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_verdicts_status ON flaky_verdicts(status);
+-- The is_flaky tool resolves by bare `name` (and file_path::name) when the
+-- caller has no exact classname::name key — the common triage case. Without this
+-- index those lookups scan the whole table on the latency-sensitive tool path.
+-- Selective enough that the OR on classname/file_path filters the tiny matched set.
+CREATE INDEX IF NOT EXISTS idx_verdicts_name ON flaky_verdicts(name);
 
 CREATE TABLE IF NOT EXISTS scan_runs (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
