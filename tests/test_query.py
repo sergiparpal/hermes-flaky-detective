@@ -1,0 +1,235 @@
+"""Tests for the read-only test-history reader (``query.py``) and path resolution.
+
+Exercised against a synthetic test-history DB (``fixtures.build_test_history_db``)
+so the assertions do not depend on a live test-history install or XML parsing.
+"""
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from fixtures import build_test_history_db
+from hermes_flaky_detective import config, query, timeutil
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+CUTOFF = timeutil.window_cutoff(NOW, 14)   # 2026-05-18T12:00:00
+
+
+def _read(path):
+    return query.read_test_history(path, CUTOFF)
+
+
+# ---------------------------------------------------------------------------
+# Windowing
+# ---------------------------------------------------------------------------
+
+
+def test_windowing_by_effective_timestamp(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "in.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "test_in", "status": "failed"}]},
+        {"source_file": "out.xml", "run_timestamp": "2026-05-01T09:00:00",  # before cutoff
+         "cases": [{"name": "test_out", "status": "failed"}]},
+    ])
+    names = {r[1] for r in _read(db).rows}
+    assert names == {"test_in"}
+
+
+def test_null_run_timestamp_falls_back_to_ingested_at(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        # No run_timestamp -> windowing uses ingested_at (inside window).
+        {"source_file": "a.xml", "run_timestamp": None, "ingested_at": "2026-05-25 09:00:00",
+         "cases": [{"name": "test_recent", "status": "failed"}]},
+        # No run_timestamp, ingested_at before cutoff -> excluded.
+        {"source_file": "b.xml", "run_timestamp": None, "ingested_at": "2026-05-01 09:00:00",
+         "cases": [{"name": "test_old", "status": "failed"}]},
+    ])
+    rows = _read(db).rows
+    names = {r[1] for r in rows}
+    assert names == {"test_recent"}
+    # eff_ts should be the (normalized) ingested_at for the surviving row.
+    eff = {r[1]: r[4] for r in rows}
+    assert eff["test_recent"] == "2026-05-25T09:00:00"
+
+
+# ---------------------------------------------------------------------------
+# Reingest dedup by (source_file, run_timestamp)
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_keeps_latest_ingest_of_same_logical_run(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "ingested_at": "2026-05-20 09:05:00",
+         "cases": [{"name": "test_x", "status": "failed"}]},
+        # Same (source_file, run_timestamp), re-ingested later with a different outcome.
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "ingested_at": "2026-05-21 10:00:00",
+         "cases": [{"name": "test_x", "status": "passed"}]},
+    ])
+    rows = _read(db).rows
+    assert len(rows) == 1                      # the duplicate logical run is collapsed
+    assert rows[0][1] == "test_x"
+    assert rows[0][3] == "passed"              # the most-recently-ingested wins
+
+
+def test_distinct_run_timestamps_are_not_deduped(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "test_x", "status": "failed"}]},
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-21T09:00:00",
+         "cases": [{"name": "test_x", "status": "passed"}]},
+    ])
+    rows = _read(db).rows
+    assert len(rows) == 2                       # different timestamps = two logical runs
+
+
+# ---------------------------------------------------------------------------
+# skipped exclusion / row shape / jest-style nulls
+# ---------------------------------------------------------------------------
+
+
+def test_skipped_cases_excluded(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00", "cases": [
+            {"name": "test_run", "status": "failed"},
+            {"name": "test_skipped", "status": "skipped"},
+        ]},
+    ])
+    names = {r[1] for r in _read(db).rows}
+    assert names == {"test_run"}
+
+
+def test_row_shape_and_canonical_eff_ts(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00", "cases": [
+            {"classname": "pkg.Mod", "name": "test_a", "file_path": "src/mod.py",
+             "status": "failed"},
+        ]},
+    ])
+    rows = _read(db).rows
+    assert len(rows) == 1
+    classname, name, file_path, status, eff_ts = rows[0]
+    assert (classname, name, file_path, status) == ("pkg.Mod", "test_a", "src/mod.py", "failed")
+    assert eff_ts == "2026-05-20T09:00:00"     # canonical naive-UTC ISO seconds
+
+
+def test_jest_style_null_file_path_preserved(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00", "cases": [
+            {"classname": None, "name": "renders header", "file_path": None, "status": "failed"},
+        ]},
+    ])
+    rows = _read(db).rows
+    assert rows[0][0] is None        # classname
+    assert rows[0][2] is None        # file_path
+
+
+# ---------------------------------------------------------------------------
+# Fallback path parity (no window functions)
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_matches_window_function_path(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "ingested_at": "2026-05-20 09:05:00",
+         "cases": [{"name": "test_x", "status": "failed"},
+                   {"name": "test_y", "status": "skipped"}]},
+        {"source_file": "ci/junit.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "ingested_at": "2026-05-21 10:00:00",
+         "cases": [{"name": "test_x", "status": "passed"}]},
+        {"source_file": "other.xml", "run_timestamp": "2026-05-22T09:00:00",
+         "cases": [{"name": "test_z", "status": "error"}]},
+    ])
+    conn = sqlite3.connect(query.read_only_uri(db), uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        primary = query._read_windowed(conn, CUTOFF)
+        fallback = query._fallback_read(conn, CUTOFF)
+    finally:
+        conn.close()
+    assert sorted(primary) == sorted(fallback)
+
+
+# ---------------------------------------------------------------------------
+# schema_version guard
+# ---------------------------------------------------------------------------
+
+
+def test_reads_source_schema_version(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t", "status": "failed"}]},
+    ], schema_version=1)
+    assert _read(db).source_schema_version == 1
+
+
+def test_schema_mismatch_warns_but_still_reads(tmp_path, caplog):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t", "status": "failed"}]},
+    ], schema_version=999)
+    with caplog.at_level("WARNING"):
+        result = _read(db)
+    assert result.source_schema_version == 999
+    assert any("schema_version" in rec.message for rec in caplog.records)
+    assert {r[1] for r in result.rows} == {"t"}   # data still returned
+
+
+# ---------------------------------------------------------------------------
+# Read-only enforcement / error handling
+# ---------------------------------------------------------------------------
+
+
+def test_read_only_uri_contains_mode_ro(tmp_path):
+    assert query.read_only_uri(tmp_path / "h.db").endswith("?mode=ro")
+
+
+def test_connection_is_read_only(tmp_path):
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t", "status": "failed"}]},
+    ])
+    conn = sqlite3.connect(query.read_only_uri(db), uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO test_runs (suite_name, source_file) VALUES ('x', 'y')")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def test_missing_db_raises_clean_error(tmp_path):
+    with pytest.raises(query.TestHistoryUnavailable) as exc:
+        _read(tmp_path / "does-not-exist.db")
+    assert "not found" in str(exc.value)
+
+
+def test_non_test_history_file_raises_clean_error(tmp_path):
+    bogus = tmp_path / "bogus.db"
+    conn = sqlite3.connect(str(bogus))
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(query.TestHistoryUnavailable):
+        _read(bogus)
+
+
+# ---------------------------------------------------------------------------
+# test-history DB path resolution (§5.6)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_db_path_default(profile_env):
+    cfg = config.get_config()
+    path = config.resolve_test_history_db_path(cfg)
+    assert path == profile_env / "test-history" / "history.db"
+
+
+def test_resolve_db_path_override(profile_env, tmp_path):
+    override = tmp_path / "custom" / "th.db"
+    path = config.resolve_test_history_db_path({"test_history_db_path": str(override)})
+    assert path == Path(override).resolve()

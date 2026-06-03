@@ -1,0 +1,6 @@
+name: hermes-flaky-detective
+version: 0.1.0
+description: "General plugin that detects flaky tests by reading the hermes-test-history SQLite database (read-only), persists verdicts to its own local SQLite DB, exposes an is_flaky tool, and runs a nightly no-agent detection sweep at zero LLM cost."
+author: "sergiparpal"
+provides_tools:
+  - is_flaky

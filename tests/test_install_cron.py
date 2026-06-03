@@ -1,0 +1,98 @@
+"""Tests for ``hermes flaky-detective install-cron`` (Phase 7).
+
+The single sanctioned subprocess (``hermes cron create``) is mocked, so these
+tests never shell out to a real hermes CLI and have no side effects beyond the
+temp HERMES_HOME.
+"""
+
+import argparse
+import os
+import stat
+from types import SimpleNamespace
+
+from hermes_flaky_detective import cli, config
+
+
+def _run(argv):
+    parser = argparse.ArgumentParser(prog="flaky-detective")
+    cli.setup_parser(parser)
+    return cli.handle(parser.parse_args(argv))
+
+
+def _shim_path(home):
+    return home / "scripts" / "flaky-scan.sh"
+
+
+# ---------------------------------------------------------------------------
+# shim install + config persistence (no job creation)
+# ---------------------------------------------------------------------------
+
+
+def test_no_create_installs_shim_and_prints_command(profile_env, capsys):
+    assert _run(["install-cron", "--no-create", "--deliver", "local"]) == 0
+    out = capsys.readouterr().out
+    shim = _shim_path(profile_env)
+    assert shim.exists()
+    assert stat.S_IMODE(os.stat(shim).st_mode) == 0o700
+    assert "hermes cron create" in out
+    assert "--no-agent --script flaky-scan.sh" in out
+    assert "gateway" in out.lower()
+
+
+def test_persists_resolved_options(profile_env, capsys):
+    assert _run(["install-cron", "--no-create", "--schedule", "0 7 * * *",
+                 "--deliver", "slack", "--window", "7", "--min-fails", "2"]) == 0
+    cfg = config.get_config()
+    assert cfg["schedule"] == "0 7 * * *"
+    assert cfg["deliver"] == "slack"
+    assert cfg["window_days"] == 7
+    assert cfg["min_fails"] == 2
+
+
+# ---------------------------------------------------------------------------
+# job creation via the (mocked) subprocess
+# ---------------------------------------------------------------------------
+
+
+def test_create_success(profile_env, capsys, monkeypatch):
+    calls = {}
+
+    def fake_run(cmd, capture_output=False, text=False):
+        calls["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="created job id=job_123", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert _run(["install-cron", "--deliver", "local", "--schedule", "0 9 * * *"]) == 0
+    out = capsys.readouterr().out
+    assert "created cron job 'flaky-detective'" in out
+    # The subprocess was invoked with the documented arguments.
+    assert calls["cmd"][:4] == ["hermes", "cron", "create", "0 9 * * *"]
+    assert "--no-agent" in calls["cmd"]
+    assert calls["cmd"][-2:] == ["--name", "flaky-detective"]
+    assert _shim_path(profile_env).exists()
+
+
+def test_create_failure_falls_back_to_printing(profile_env, capsys, monkeypatch):
+    def fake_run(cmd, capture_output=False, text=False):
+        return SimpleNamespace(returncode=1, stdout="", stderr="gateway not configured")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert _run(["install-cron", "--deliver", "local"]) == 0
+    out = capsys.readouterr().out
+    assert "gateway not configured" in out
+    assert "hermes cron create" in out
+    assert "gateway" in out.lower()
+    # Shim is still installed even though the job was not created.
+    assert _shim_path(profile_env).exists()
+
+
+def test_create_when_hermes_cli_missing_falls_back(profile_env, capsys, monkeypatch):
+    def fake_run(cmd, capture_output=False, text=False):
+        raise FileNotFoundError("hermes")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert _run(["install-cron", "--deliver", "local"]) == 0
+    out = capsys.readouterr().out
+    assert "could not run the hermes CLI" in out
+    assert "hermes cron create" in out
+    assert _shim_path(profile_env).exists()

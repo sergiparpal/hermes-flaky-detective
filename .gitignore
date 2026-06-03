@@ -18,3 +18,6 @@ dist/
 
 # Windows/WSL "mark of the web" metadata
 *:Zone.Identifier
+
+# Phase 0 questionnaire scratch artifact
+.flaky-plan-config.json
