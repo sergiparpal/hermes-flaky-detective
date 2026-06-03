@@ -82,6 +82,23 @@ def _resolve_scan_params(args, cfg):
     return window_days, min_fails, include_errors
 
 
+def _validate_tunables(window_days: int, min_fails: int) -> None:
+    """Reject nonsensical tunables before they produce misleading verdicts.
+
+    ``min_fails`` must be ``>= 1``: with ``min_fails <= 0`` the ``fails >= min_fails``
+    test is always true, so every all-passing (perfectly stable) test would be
+    mislabeled *flaky*. ``window_days`` must be ``>= 1``: a zero/negative window
+    selects no runs. Raises ``ValueError`` with a one-line, joined message.
+    """
+    problems = []
+    if window_days < 1:
+        problems.append(f"--window must be >= 1 (got {window_days})")
+    if min_fails < 1:
+        problems.append(f"--min-fails must be >= 1 (got {min_fails})")
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
 def _cmd_scan(args) -> int:
     from . import config, detect, domain, query, reporting, storage, timeutil
 
@@ -89,6 +106,12 @@ def _cmd_scan(args) -> int:
     window_days, min_fails, include_errors = _resolve_scan_params(args, cfg)
     report_scope = cfg.get("report_scope", domain.DEFAULT_REPORT_SCOPE)
     fmt = args.format
+
+    try:
+        _validate_tunables(window_days, min_fails)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     now = datetime.now(timezone.utc)
     cutoff = timeutil.window_cutoff(now, window_days)
@@ -107,10 +130,35 @@ def _cmd_scan(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    conn = storage.get_connection()
+
+    if not read.rows:
+        # test-history is reachable but has no runs in the window (e.g. every run
+        # has aged past it). Do NOT overwrite the snapshot with an empty one: that
+        # would make every previously-flaky test report as "no longer flaky" in the
+        # changes-only cron and make is_flaky answer "unknown" for everything. Keep
+        # the prior verdicts; record an audit row noting nothing was examined.
+        on_record = sum(storage.count_by_status(conn).values())
+        storage.record_scan_run(
+            conn, window_days=window_days, min_fails=min_fails, include_errors=include_errors,
+            source_schema_version=read.source_schema_version, tests_examined=0, flaky_found=0,
+        )
+        if fmt == "json":
+            empty_meta = {
+                "window_days": window_days, "min_fails": min_fails,
+                "include_errors": include_errors,
+                "source_schema_version": read.source_schema_version,
+                "tests_examined": 0, "flaky_found": 0,
+            }
+            print(reporting.render_json([], empty_meta, [], []))
+        elif fmt != "cron":  # human; cron stays silent (an empty tick)
+            print(f"No test runs in the last {window_days} day(s); "
+                  f"keeping the previous verdicts ({on_record} on record).")
+        return 0
+
     verdicts = detect.compute_verdicts(read.rows, now, window_days, min_fails, include_errors)
     new_flaky_keys = {v.test_key for v in verdicts if v.status == domain.VERDICT_FLAKY}
 
-    conn = storage.get_connection()
     prev_flaky_keys = storage.read_flaky_keys(conn)        # BEFORE replace (for the diff)
     storage.replace_verdicts(conn, verdicts)
     storage.record_scan_run(
@@ -257,6 +305,14 @@ def _cmd_install_cron(args) -> int:
     deliver = args.deliver or cfg.get("deliver", domain.DEFAULT_DELIVER)
     window_days = args.window if args.window is not None else int(cfg["window_days"])
     min_fails = args.min_fails if args.min_fails is not None else int(cfg["min_fails"])
+
+    # Validate before persisting/installing anything, so a bad value is never
+    # written into config.json nor baked into the scheduled job.
+    try:
+        _validate_tunables(window_days, min_fails)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # (b) persist resolved options so the scheduled `scan` uses them.
     config.write_config({

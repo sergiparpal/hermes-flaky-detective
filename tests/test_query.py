@@ -218,6 +218,16 @@ def test_non_test_history_file_raises_clean_error(tmp_path):
         _read(bogus)
 
 
+def test_corrupt_db_raises_clean_error(tmp_path):
+    # A genuinely corrupt / non-SQLite file raises sqlite3.DatabaseError ("file is
+    # not a database"), which is NOT an OperationalError. The reader must still
+    # surface a clean TestHistoryUnavailable, never an uncaught traceback.
+    bogus = tmp_path / "corrupt.db"
+    bogus.write_bytes(b"this is not a sqlite database at all\n" * 8)
+    with pytest.raises(query.TestHistoryUnavailable):
+        _read(bogus)
+
+
 # ---------------------------------------------------------------------------
 # test-history DB path resolution (§5.6)
 # ---------------------------------------------------------------------------
@@ -233,3 +243,29 @@ def test_resolve_db_path_override(profile_env, tmp_path):
     override = tmp_path / "custom" / "th.db"
     path = config.resolve_test_history_db_path({"test_history_db_path": str(override)})
     assert path == Path(override).resolve()
+
+
+def test_resolve_db_path_expands_tilde():
+    # A "~/..." override must expand to $HOME, not a literal "~" dir under cwd.
+    path = config.resolve_test_history_db_path({"test_history_db_path": "~/myhist/history.db"})
+    text = str(path).replace("\\", "/")
+    assert "~" not in text
+    assert text.endswith("myhist/history.db")
+
+
+# ---------------------------------------------------------------------------
+# config value coercion (a hand-edited config must never crash the scan path)
+# ---------------------------------------------------------------------------
+
+
+def test_get_config_coerces_malformed_values(profile_env):
+    # An unparseable int -> the default; a stringified int -> int; the string
+    # "false" -> False (a typo, never bool("false") which is True).
+    config.config_path().write_text(
+        '{"min_fails": "oops", "window_days": "7", "include_errors": "false"}',
+        encoding="utf-8",
+    )
+    cfg = config.get_config()
+    assert cfg["min_fails"] == config.DEFAULT_CONFIG["min_fails"]
+    assert cfg["window_days"] == 7 and isinstance(cfg["window_days"], int)
+    assert cfg["include_errors"] is False

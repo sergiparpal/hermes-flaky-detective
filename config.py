@@ -40,6 +40,56 @@ def config_path() -> Path:
     return storage.get_storage_dir() / "config.json"
 
 
+# ---------------------------------------------------------------------------
+# Value coercion — keep a hand-edited config from crashing a later int()/bool()
+# ---------------------------------------------------------------------------
+
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _BOOL_TRUE:
+            return True
+        if text in _BOOL_FALSE:
+            return False
+    return default
+
+
+def _as_str(value, default: str) -> str:
+    return value if isinstance(value, str) else default
+
+
+def _coerce_config(cfg: dict) -> dict:
+    """Coerce known keys to their expected types, degrading to the default on a
+    malformed value, so a hand-edited ``config.json`` can never crash a later
+    ``int()``/``bool()`` in the scan path. Note ``"false"`` (a JSON *string*) is a
+    typo, not a truthy value: it coerces to ``False``, never ``bool("false")``.
+    """
+    out = dict(cfg)
+    for key in ("window_days", "min_fails", "source_schema_version"):
+        out[key] = _as_int(out.get(key), DEFAULT_CONFIG[key])
+    out["include_errors"] = _as_bool(out.get("include_errors"), DEFAULT_CONFIG["include_errors"])
+    for key in ("deliver", "schedule", "report_scope"):
+        out[key] = _as_str(out.get(key), DEFAULT_CONFIG[key])
+    thp = out.get("test_history_db_path")
+    out["test_history_db_path"] = thp if (thp is None or isinstance(thp, str)) else None
+    return out
+
+
 def get_config() -> dict:
     """User ``config.json`` merged over :data:`DEFAULT_CONFIG` (defaults on error)."""
     path = config_path()
@@ -51,7 +101,7 @@ def get_config() -> dict:
                 user_cfg = loaded
         except Exception:
             user_cfg = {}
-    return {**DEFAULT_CONFIG, **user_cfg}
+    return _coerce_config({**DEFAULT_CONFIG, **user_cfg})
 
 
 def write_config(updates: dict) -> dict:
@@ -77,7 +127,7 @@ def write_config(updates: dict) -> dict:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    return {**DEFAULT_CONFIG, **merged}
+    return _coerce_config({**DEFAULT_CONFIG, **merged})
 
 
 def resolve_test_history_db_path(config: dict) -> Path:
@@ -95,7 +145,11 @@ def resolve_test_history_db_path(config: dict) -> Path:
     """
     override = config.get("test_history_db_path")
     if override:
-        return Path(os.path.realpath(str(override)))
+        # expanduser/expandvars first: realpath alone leaves a leading ``~`` (or a
+        # ``$VAR``) as a literal directory name, so ``~/path`` would resolve under
+        # the cwd instead of $HOME.
+        expanded = os.path.expanduser(os.path.expandvars(str(override)))
+        return Path(os.path.realpath(expanded))
     from . import storage  # lazy: avoids import cycle
 
     return storage.get_hermes_home() / "test-history" / TEST_HISTORY_DB_FILENAME

@@ -98,12 +98,16 @@ def read_only_uri(db_path) -> str:
 def read_source_schema_version(conn: sqlite3.Connection) -> int | None:
     """Highest ``schema_version`` recorded by the test-history DB, or ``None``.
 
-    ``None`` means the table is absent — the file may predate versioning or not
-    be a test-history DB at all.
+    ``None`` means the version is unreadable — the table is absent (the file may
+    predate versioning or not be a test-history DB), or the file is not a valid
+    SQLite database at all. We catch ``DatabaseError`` (the parent of
+    ``OperationalError``) so a corrupt file reports ``None`` here rather than
+    escaping; the windowed read that follows then converts it to a clean
+    :class:`TestHistoryUnavailable`.
     """
     try:
         row = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.DatabaseError:
         return None
     return int(row[0]) if row and row[0] is not None else 0
 
@@ -201,9 +205,11 @@ def read_test_history(db_path, cutoff: str) -> ReadResult:
         _warn_on_schema_mismatch(version)
         try:
             rows = _read_windowed(conn, cutoff)
-        except sqlite3.OperationalError as exc:
-            # e.g. "no such table: test_runs" — the file exists but is not a
-            # test-history database. Surface it as a clean, actionable error.
+        except sqlite3.DatabaseError as exc:
+            # e.g. "no such table: test_runs" (OperationalError — exists but wrong
+            # schema) or "file is not a database" (DatabaseError — a corrupt/non-
+            # SQLite file). DatabaseError is the parent of OperationalError, so this
+            # one catch covers both. Surface either as a clean, actionable error.
             raise TestHistoryUnavailable(
                 f"the file at {path} does not look like a test-history database: {exc}"
             ) from exc

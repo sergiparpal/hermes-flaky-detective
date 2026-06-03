@@ -140,6 +140,50 @@ def test_scan_include_errors_default_counts_error(profile_env, capsys):
 
 
 # ---------------------------------------------------------------------------
+# scan — tunable validation
+# ---------------------------------------------------------------------------
+
+
+def test_scan_rejects_nonpositive_min_fails(profile_env, capsys):
+    # min_fails <= 0 would mark every all-passing test flaky -> reject (exit 2),
+    # before even touching test-history.
+    assert _run(["scan", "--min-fails", "0", "--format", "json"]) == 2
+    assert "min-fails" in capsys.readouterr().err
+
+
+def test_scan_rejects_nonpositive_window(profile_env, capsys):
+    assert _run(["scan", "--window", "0"]) == 2
+    assert "window" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# scan — empty window must not wipe the previous snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_scan_empty_window_preserves_previous_verdicts(profile_env, capsys):
+    # First, a normal scan records a flaky verdict.
+    _seed_test_history(profile_env)
+    assert _run(["scan", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["scan"]["flaky_found"] == 1
+
+    # Re-seed the test-history DB with only ancient runs (older than the window),
+    # so the next scan reads zero rows.
+    th = profile_env / "test-history" / "history.db"
+    th.unlink()
+    old = (_NOW - timedelta(days=400)).isoformat()
+    build_test_history_db(th, [{"source_file": "old.xml", "run_timestamp": old, "cases": [
+        {"classname": "pkg.Mod", "name": "test_flaky", "file_path": "src/mod.py", "status": "passed"},
+    ]}])
+
+    assert _run(["scan", "--format", "human"]) == 0
+    assert "keeping the previous verdicts" in capsys.readouterr().out
+    # The earlier flaky verdict survives the empty scan (not overwritten).
+    conn = storage.get_connection()
+    assert storage.get_verdict(conn, "pkg.Mod::test_flaky")["status"] == domain.VERDICT_FLAKY
+
+
+# ---------------------------------------------------------------------------
 # scan — test-history unavailable
 # ---------------------------------------------------------------------------
 

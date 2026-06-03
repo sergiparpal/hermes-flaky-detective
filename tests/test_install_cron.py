@@ -49,6 +49,15 @@ def test_persists_resolved_options(profile_env, capsys):
     assert cfg["min_fails"] == 2
 
 
+def test_rejects_nonpositive_min_fails_without_persisting(profile_env, capsys):
+    # A bad tunable is rejected (exit 2) before the shim or config is written.
+    assert _run(["install-cron", "--no-create", "--min-fails", "0"]) == 2
+    assert "min-fails" in capsys.readouterr().err
+    assert not _shim_path(profile_env).exists()
+    # config.json was not created by the aborted run.
+    assert not config.config_path().exists()
+
+
 # ---------------------------------------------------------------------------
 # job creation via the (mocked) subprocess
 # ---------------------------------------------------------------------------
