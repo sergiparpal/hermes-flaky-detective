@@ -65,6 +65,29 @@ DEFAULT_REPORT_SCOPE = "changes-only"  # nightly report scope
 EXPECTED_SOURCE_SCHEMA_VERSION = 1
 
 
+def validate_tunables(window_days: int, min_fails: int) -> None:
+    """Reject nonsensical detection tunables before they produce wrong verdicts.
+
+    This is a domain invariant, not a CLI concern, so it lives next to the
+    defaults it guards: every caller that sets these tunables (the ``scan``
+    use-case, ``install-cron``, any future trigger) enforces the same rule.
+
+    ``min_fails`` must be ``>= 1``: with ``min_fails <= 0`` the ``fails >=
+    min_fails`` test is always true, so every all-passing (perfectly stable) test
+    would be mislabeled *flaky*. ``window_days`` must be ``>= 1``: a zero/negative
+    window selects no runs. Raises :class:`ValueError` with a one-line, joined
+    message (the tunable labels are kept neutral so the message reads the same
+    whether the value came from a flag or from ``config.json``).
+    """
+    problems = []
+    if window_days < 1:
+        problems.append(f"window must be >= 1 (got {window_days})")
+    if min_fails < 1:
+        problems.append(f"min-fails must be >= 1 (got {min_fails})")
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
 # ---------------------------------------------------------------------------
 # Test identity
 # ---------------------------------------------------------------------------

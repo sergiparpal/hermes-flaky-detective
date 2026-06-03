@@ -1,22 +1,28 @@
 """Verdicts-DB lifecycle and profile-aware storage paths.
 
-No class hierarchy — module-level functions plus one lazily-initialized singleton
-(the connection). Storage paths derive from Hermes's profile-aware home, never
-hardcoded, mirroring the sibling test-history plugin's ``storage.py`` (re-derived
-here, not imported, to keep the GPL/data-only boundary intact).
+The pure SQL helpers are module-level functions that each take an explicit
+``conn`` (dependency-injected, trivially testable). Connection *ownership* lives
+in the :class:`Storage` object: it opens one connection lazily and the caller that
+constructs it owns its lifecycle — registration holds a long-lived instance for
+the ``is_flaky`` tool path, while each short-lived CLI command uses one as a
+context manager. There is deliberately no module-global connection (and no
+test-only reset hook): global state was the one piece coupling every caller to a
+hidden singleton.
 
-Path helpers land in Phase 3 (the reader/config layer needs the home); the
-verdicts-DB connection, schema application, and the transactional snapshot writes
-land in Phase 4.
+Storage paths derive from Hermes's profile-aware home, never hardcoded, mirroring
+the sibling test-history plugin's ``storage.py`` (re-derived here, not imported,
+to keep the GPL/data-only boundary intact).
 """
 
 import os
 import sqlite3
+from dataclasses import fields as _dc_fields
 from pathlib import Path
 
-# Module-level singleton: the verdicts-DB connection, opened on first use and
-# closed at process exit (and explicitly in tests via reset_for_tests).
-_connection: sqlite3.Connection | None = None
+# The verdict field set has a single owner: the ``Verdict`` dataclass. Imported at
+# module load so ``_VERDICT_COLS`` can be derived from it below. No import cycle —
+# ``detect`` imports only the import-free ``domain``, never ``storage``.
+from .detect import Verdict
 
 
 # ---------------------------------------------------------------------------
@@ -66,40 +72,95 @@ def get_db_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def get_connection() -> sqlite3.Connection:
-    """Lazy singleton connection to the verdicts DB, with the schema applied.
+def open_connection(db_path=None) -> sqlite3.Connection:
+    """Open the verdicts DB (creating it and applying the schema); return the conn.
 
-    ``check_same_thread=False`` because the ``is_flaky`` tool may run in the
-    gateway's async worker pool. WAL journal mode lets the tool's read-only
-    lookups proceed concurrently with a ``scan`` writer in another process
-    (CLI / nightly cron) instead of blocking on the rollback-journal lock.
+    No global state — the caller owns the returned connection's lifecycle (close
+    it, or let a :class:`Storage` own it). ``db_path`` defaults to
+    :func:`get_db_path`. ``check_same_thread=False`` because the ``is_flaky`` tool
+    may run in the gateway's async worker pool. WAL journal mode lets the tool's
+    read-only lookups proceed concurrently with a ``scan`` writer in another
+    process (CLI / nightly cron) instead of blocking on the rollback-journal lock.
     """
-    global _connection
-    if _connection is None:
-        from .schema import apply_schema  # lazy import (keep startup cheap)
+    from .schema import apply_schema  # lazy import (keep startup cheap)
 
-        db_path = get_db_path()
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        # Owner-only: the DB records test identifiers captured from artifacts. The
-        # 0o700 directory is the primary guard (covers the -wal/-shm sidecars);
-        # this narrows the DB file itself. Best-effort on non-POSIX mounts.
-        try:
-            os.chmod(db_path, 0o600)
-        except OSError:
-            pass
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        apply_schema(conn)
-        _connection = conn
-    return _connection
+    path = Path(db_path) if db_path is not None else get_db_path()
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    # Owner-only: the DB records test identifiers captured from artifacts. The
+    # 0o700 directory is the primary guard (covers the -wal/-shm sidecars); this
+    # narrows the DB file itself. Best-effort on non-POSIX mounts.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    apply_schema(conn)
+    return conn
 
 
-def reset_for_tests() -> None:
-    """Test-only hook: close and clear the module-level connection singleton."""
-    global _connection
-    if _connection is not None:
-        _connection.close()
-    _connection = None
+class Storage:
+    """Owns one lazily-opened verdicts-DB connection (replaces the old singleton).
+
+    Constructing a ``Storage`` does no I/O — the connection opens on first use —
+    so registration can cheaply hold a long-lived instance for the ``is_flaky``
+    tool path while each short-lived CLI command uses one as a context manager
+    (``with Storage() as store: ...``). Lifecycle is explicit: whoever constructs
+    it owns it, so there is no hidden module global to reset between tests.
+
+    The verdict methods delegate to the module-level SQL helpers, passing the
+    owned connection — those helpers stay independently unit-testable with any
+    ``conn``.
+    """
+
+    def __init__(self, db_path=None):
+        self._db_path = db_path
+        self._conn: sqlite3.Connection | None = None
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The owned connection, opened on first access."""
+        if self._conn is None:
+            self._conn = open_connection(self._db_path)
+        return self._conn
+
+    def close(self) -> None:
+        """Close the connection if it was opened; a no-op otherwise."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> "Storage":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # -- verdict operations (delegate to the conn-taking helpers below) --------
+
+    def resolve_verdicts(self, test_id: str) -> list:
+        return resolve_verdicts(self.conn, test_id)
+
+    def replace_verdicts(self, verdicts) -> None:
+        return replace_verdicts(self.conn, verdicts)
+
+    def record_scan_run(self, **kwargs) -> int:
+        return record_scan_run(self.conn, **kwargs)
+
+    def read_flaky_keys(self) -> set:
+        return read_flaky_keys(self.conn)
+
+    def get_verdict(self, test_key: str):
+        return get_verdict(self.conn, test_key)
+
+    def read_verdicts(self, statuses=None) -> list:
+        return read_verdicts(self.conn, statuses)
+
+    def last_scan_run(self):
+        return last_scan_run(self.conn)
+
+    def count_by_status(self) -> dict:
+        return count_by_status(self.conn)
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +168,12 @@ def reset_for_tests() -> None:
 # ---------------------------------------------------------------------------
 
 # Column order shared by the snapshot INSERT and the Verdict->row mapping.
-# ``computed_at`` is omitted so its DEFAULT CURRENT_TIMESTAMP applies.
-_VERDICT_COLS = (
-    "test_key", "classname", "name", "file_path", "passes", "fails", "runs",
-    "window_days", "first_seen", "last_seen", "last_failure", "status",
-)
+# Derived from the ``Verdict`` dataclass so the field set has a single owner: add
+# or rename a verdict field in ``detect.Verdict`` and the INSERT follows
+# automatically (a test pins this against the DDL). ``computed_at`` is a DB-only
+# column (its DEFAULT CURRENT_TIMESTAMP applies) and is intentionally absent from
+# the dataclass, so it never appears here.
+_VERDICT_COLS = tuple(f.name for f in _dc_fields(Verdict))
 _VERDICT_INSERT = (
     "INSERT INTO flaky_verdicts (" + ", ".join(_VERDICT_COLS) + ") "
     "VALUES (" + ", ".join("?" * len(_VERDICT_COLS)) + ")"
@@ -163,6 +225,35 @@ def get_verdict(conn: sqlite3.Connection, test_key: str):
     return conn.execute(
         "SELECT * FROM flaky_verdicts WHERE test_key = ?", (test_key,)
     ).fetchone()
+
+
+def resolve_verdicts(conn: sqlite3.Connection, test_id: str) -> list:
+    """Verdict rows matching ``test_id``, worst-first (most failures first).
+
+    The resolution the ``is_flaky`` tool needs, owned here with the rest of the
+    ``flaky_verdicts`` SQL rather than reimplemented in the tool layer. Resolution
+    order: an exact ``test_key`` (``classname::name``); else, for a ``left::right``
+    identifier, ``name = right`` with ``classname`` *or* ``file_path`` equal to
+    ``left`` (so ``file_path::name`` works even though the key is built from
+    classname); else a bare ``name`` match. Every value binds through ``?``.
+    """
+    rows = conn.execute(
+        "SELECT * FROM flaky_verdicts WHERE test_key = ? ORDER BY fails DESC, runs DESC",
+        (test_id,),
+    ).fetchall()
+    if rows:
+        return rows
+    if "::" in test_id:
+        left, right = (p.strip() for p in test_id.rsplit("::", 1))
+        return conn.execute(
+            "SELECT * FROM flaky_verdicts WHERE name = ? AND (classname = ? OR file_path = ?) "
+            "ORDER BY fails DESC, runs DESC, test_key ASC",
+            (right, left, left),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM flaky_verdicts WHERE name = ? ORDER BY fails DESC, runs DESC, test_key ASC",
+        (test_id,),
+    ).fetchall()
 
 
 def read_verdicts(conn: sqlite3.Connection, statuses=None) -> list:

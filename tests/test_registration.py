@@ -66,8 +66,8 @@ def test_schema_is_valid_and_serializable():
 # ---------------------------------------------------------------------------
 
 
-def _seed(conn):
-    storage.replace_verdicts(conn, [
+def _seed(store):
+    store.replace_verdicts([
         _v("auth.test_oauth::test_oauth_login", domain.VERDICT_FLAKY, passes=4, fails=3,
            classname="auth.test_oauth", file_path="src/auth/test_oauth.py"),
         _v("billing.test_pay::test_charge", domain.VERDICT_STABLE, passes=10, fails=0,
@@ -76,8 +76,10 @@ def _seed(conn):
 
 
 def test_handler_returns_flaky_verdict(profile_env):
-    _seed(storage.get_connection())
-    payload = json.loads(_handle_is_flaky({"test_id": "auth.test_oauth::test_oauth_login"}))
+    with storage.Storage() as store:
+        _seed(store)
+        payload = json.loads(_handle_is_flaky(
+            {"test_id": "auth.test_oauth::test_oauth_login"}, store=store))
     assert payload["success"] is True
     assert payload["is_flaky"] is True
     assert payload["status"] == domain.VERDICT_FLAKY
@@ -89,24 +91,28 @@ def test_handler_returns_flaky_verdict(profile_env):
 
 
 def test_handler_returns_non_flaky_for_stable(profile_env):
-    _seed(storage.get_connection())
-    payload = json.loads(_handle_is_flaky({"test_id": "test_charge"}))   # bare name
+    with storage.Storage() as store:
+        _seed(store)
+        payload = json.loads(_handle_is_flaky({"test_id": "test_charge"}, store=store))  # bare name
     assert payload["success"] is True
     assert payload["is_flaky"] is False
     assert payload["status"] == domain.VERDICT_STABLE
 
 
 def test_handler_resolves_by_file_path_and_name(profile_env):
-    _seed(storage.get_connection())
-    payload = json.loads(_handle_is_flaky({"test_id": "src/auth/test_oauth.py::test_oauth_login"}))
+    with storage.Storage() as store:
+        _seed(store)
+        payload = json.loads(_handle_is_flaky(
+            {"test_id": "src/auth/test_oauth.py::test_oauth_login"}, store=store))
     assert payload["success"] is True
     assert payload["is_flaky"] is True
     assert payload["test_key"] == "auth.test_oauth::test_oauth_login"
 
 
 def test_handler_unknown_for_unseen_test(profile_env):
-    _seed(storage.get_connection())
-    payload = json.loads(_handle_is_flaky({"test_id": "nonexistent_test"}))
+    with storage.Storage() as store:
+        _seed(store)
+        payload = json.loads(_handle_is_flaky({"test_id": "nonexistent_test"}, store=store))
     assert payload["success"] is True
     assert payload["is_flaky"] is False
     assert payload["status"] == domain.VERDICT_UNKNOWN
@@ -115,8 +121,8 @@ def test_handler_unknown_for_unseen_test(profile_env):
 
 def test_handler_unknown_when_never_scanned(profile_env):
     # No seed: the DB exists (schema applied) but has zero verdicts.
-    storage.get_connection()
-    payload = json.loads(_handle_is_flaky({"test_id": "anything"}))
+    with storage.Storage() as store:
+        payload = json.loads(_handle_is_flaky({"test_id": "anything"}, store=store))
     assert payload["success"] is True
     assert payload["status"] == domain.VERDICT_UNKNOWN
 
@@ -129,5 +135,5 @@ def test_handler_bad_input(profile_env):
 
 
 def test_handler_returns_json_string(profile_env):
-    storage.get_connection()
+    # No store passed: the handler opens (and closes) a transient Storage itself.
     assert isinstance(_handle_is_flaky({"test_id": "x"}), str)

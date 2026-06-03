@@ -87,11 +87,22 @@ def test_get_verdict_and_read_verdicts_and_counts(verdicts_db):
 
 
 def test_storage_permissions_are_owner_only(profile_env):
-    conn = storage.get_connection()
-    try:
+    with storage.Storage() as store:
+        store.conn                       # force the lazy open (creates dir + DB file)
         storage_dir = storage.get_storage_dir()
         db_path = storage.get_db_path()
         assert stat.S_IMODE(os.stat(storage_dir).st_mode) == 0o700
         assert stat.S_IMODE(os.stat(db_path).st_mode) == 0o600
-    finally:
-        conn.close()
+
+
+def test_verdict_field_set_has_a_single_owner(verdicts_db):
+    # P2 pin: the verdict field set is declared once (the Verdict dataclass) and the
+    # INSERT columns and the DDL must both track it. If any of the three drifts,
+    # this fails — catching the "add a field, forget one place" shotgun-surgery bug.
+    from dataclasses import fields
+
+    dataclass_fields = [f.name for f in fields(detect.Verdict)]
+    ddl_cols = [r["name"] for r in verdicts_db.execute("PRAGMA table_info(flaky_verdicts)")
+                if r["name"] != "computed_at"]   # DB-only column, defaulted
+    assert list(storage._VERDICT_COLS) == dataclass_fields
+    assert ddl_cols == dataclass_fields

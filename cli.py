@@ -87,146 +87,71 @@ def _resolve_scan_params(args, cfg):
     )
 
 
-def _validate_tunables(window_days: int, min_fails: int) -> None:
-    """Reject nonsensical tunables before they produce misleading verdicts.
+def _emit_scan(outcome, fmt, report_scope) -> int:
+    """Render a :class:`scan.ScanOutcome` in ``fmt``; return the process exit code.
 
-    ``min_fails`` must be ``>= 1``: with ``min_fails <= 0`` the ``fails >= min_fails``
-    test is always true, so every all-passing (perfectly stable) test would be
-    mislabeled *flaky*. ``window_days`` must be ``>= 1``: a zero/negative window
-    selects no runs. Raises ``ValueError`` with a one-line, joined message.
+    All presentation lives here (the use-case layer returns data, never prints).
+    Per-format rules: ``cron`` stays silent on stdout when test-history is
+    unavailable (an empty tick, so the nightly job does not alert before results
+    are ingested) and on a quiet/empty window; interactive formats surface the
+    unavailable message with a non-zero exit.
     """
-    problems = []
-    if window_days < 1:
-        problems.append(f"--window must be >= 1 (got {window_days})")
-    if min_fails < 1:
-        problems.append(f"--min-fails must be >= 1 (got {min_fails})")
-    if problems:
-        raise ValueError("; ".join(problems))
-
-
-def _build_scan_meta(*, window_days, min_fails, include_errors,
-                     source_schema_version, tests_examined, flaky_found) -> dict:
-    """The scan metadata block shared by the JSON dump and the human report."""
-    return {
-        "window_days": window_days, "min_fails": min_fails,
-        "include_errors": include_errors,
-        "source_schema_version": source_schema_version,
-        "tests_examined": tests_examined, "flaky_found": flaky_found,
-    }
-
-
-def _emit_report(fmt, report_scope, verdicts, meta, newly_flaky, newly_resolved) -> None:
-    """Print the scan result in the requested format (``cron`` may print nothing)."""
     from . import domain, reporting
 
+    if outcome.kind == "unavailable":
+        if fmt == "cron":
+            print(outcome.message, file=sys.stderr)   # note to logs, silent stdout
+            return 0
+        print(f"error: {outcome.message}", file=sys.stderr)
+        return 1
+
+    if outcome.kind == "no_runs":
+        if fmt == "json":
+            print(reporting.render_json([], outcome.meta, [], []))
+        elif fmt != "cron":  # human; cron stays silent (an empty tick)
+            print(f"No test runs in the last {outcome.meta['window_days']} day(s); "
+                  f"keeping the previous verdicts ({outcome.on_record} on record).")
+        return 0
+
+    # kind == "ok"
     if fmt == "json":
-        print(reporting.render_json(verdicts, meta, newly_flaky, newly_resolved))
+        print(reporting.render_json(outcome.verdicts, outcome.meta,
+                                    outcome.newly_flaky, outcome.newly_resolved))
     elif fmt == "cron":
-        flaky = [v for v in verdicts if v.status == domain.VERDICT_FLAKY]
+        flaky = [v for v in outcome.verdicts if v.status == domain.VERDICT_FLAKY]
         text = reporting.render_cron(
             report_scope, new_flaky_verdicts=flaky,
-            newly_flaky=newly_flaky, newly_resolved=newly_resolved,
+            newly_flaky=outcome.newly_flaky, newly_resolved=outcome.newly_resolved,
         )
         if text:
             print(text)
     else:  # human
-        print(reporting.render_human(verdicts, meta))
-
-
-def _report_unavailable(exc, fmt) -> int:
-    """Report that test-history could not be read. Returns the process exit code.
-
-    For cron, stay silent on stdout (an empty tick) so the nightly job does not
-    alert every night before results are ingested; the note still goes to
-    stderr/logs. For interactive formats, surface the message and a non-zero exit.
-    """
-    if fmt == "cron":
-        print(str(exc), file=sys.stderr)
-        return 0
-    print(f"error: {exc}", file=sys.stderr)
-    return 1
-
-
-def _report_no_runs(conn, fmt, *, window_days, min_fails, include_errors,
-                    source_schema_version) -> int:
-    """Handle a reachable-but-empty window without wiping the previous snapshot.
-
-    test-history is reachable but has no runs in the window (e.g. every run has
-    aged past it). Do NOT overwrite the snapshot with an empty one: that would make
-    every previously-flaky test report as "no longer flaky" in the changes-only
-    cron and make is_flaky answer "unknown" for everything. Keep the prior
-    verdicts; record an audit row noting nothing was examined. Returns the exit code.
-    """
-    from . import reporting, storage
-
-    on_record = sum(storage.count_by_status(conn).values())
-    storage.record_scan_run(
-        conn, window_days=window_days, min_fails=min_fails, include_errors=include_errors,
-        source_schema_version=source_schema_version, tests_examined=0, flaky_found=0,
-    )
-    if fmt == "json":
-        meta = _build_scan_meta(
-            window_days=window_days, min_fails=min_fails, include_errors=include_errors,
-            source_schema_version=source_schema_version, tests_examined=0, flaky_found=0,
-        )
-        print(reporting.render_json([], meta, [], []))
-    elif fmt != "cron":  # human; cron stays silent (an empty tick)
-        print(f"No test runs in the last {window_days} day(s); "
-              f"keeping the previous verdicts ({on_record} on record).")
+        print(reporting.render_human(outcome.verdicts, outcome.meta))
     return 0
 
 
 def _cmd_scan(args) -> int:
-    from . import config, detect, domain, query, reporting, storage, timeutil
+    from . import config, domain, scan, storage
 
     cfg = config.get_config()
     window_days, min_fails, include_errors = _resolve_scan_params(args, cfg)
     report_scope = cfg.get("report_scope", domain.DEFAULT_REPORT_SCOPE)
     fmt = args.format
-
-    try:
-        _validate_tunables(window_days, min_fails)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
     now = datetime.now(timezone.utc)
-    cutoff = timeutil.window_cutoff(now, window_days)
     db_path = config.resolve_test_history_db_path(cfg)
 
-    try:
-        read = query.read_test_history(db_path, cutoff)
-    except query.TestHistoryUnavailable as exc:
-        return _report_unavailable(exc, fmt)
-
-    conn = storage.get_connection()
-
-    if not read.rows:
-        return _report_no_runs(
-            conn, fmt, window_days=window_days, min_fails=min_fails,
-            include_errors=include_errors,
-            source_schema_version=read.source_schema_version,
-        )
-
-    verdicts = detect.compute_verdicts(read.rows, now, window_days, min_fails, include_errors)
-    new_flaky_keys = {v.test_key for v in verdicts if v.status == domain.VERDICT_FLAKY}
-
-    prev_flaky_keys = storage.read_flaky_keys(conn)        # BEFORE replace (for the diff)
-    storage.replace_verdicts(conn, verdicts)
-    storage.record_scan_run(
-        conn, window_days=window_days, min_fails=min_fails, include_errors=include_errors,
-        source_schema_version=read.source_schema_version,
-        tests_examined=len(verdicts), flaky_found=len(new_flaky_keys),
-    )
-
-    newly_flaky, newly_resolved = reporting.flaky_changes(prev_flaky_keys, new_flaky_keys)
-    meta = _build_scan_meta(
-        window_days=window_days, min_fails=min_fails, include_errors=include_errors,
-        source_schema_version=read.source_schema_version,
-        tests_examined=len(verdicts), flaky_found=len(new_flaky_keys),
-    )
-    _emit_report(fmt, report_scope, verdicts, meta, newly_flaky, newly_resolved)
-    return 0
+    # The scan workflow (validate → read → detect → persist) lives in the use-case
+    # layer; the CLI only resolves params, owns the verdicts connection, and renders.
+    with storage.Storage() as store:
+        try:
+            outcome = scan.run_scan(
+                store, window_days=window_days, min_fails=min_fails,
+                include_errors=include_errors, db_path=db_path, now=now,
+            )
+        except ValueError as exc:   # invalid tunables — rejected before any read
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return _emit_scan(outcome, fmt, report_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +163,9 @@ def _cmd_status(args) -> int:
     from . import config, storage
 
     cfg = config.get_config()
-    conn = storage.get_connection()
-    last = storage.last_scan_run(conn)
-    counts = storage.count_by_status(conn)
+    with storage.Storage() as store:
+        last = store.last_scan_run()
+        counts = store.count_by_status()
 
     print(f"verdicts_db:     {storage.get_db_path()}")
     print(f"config_path:     {config.config_path()}")
@@ -274,8 +199,8 @@ def _cmd_list(args) -> int:
         "consistently_failing": [domain.VERDICT_CONSISTENTLY_FAILING],
     }[args.status]
 
-    conn = storage.get_connection()
-    rows = storage.read_verdicts(conn, statuses)
+    with storage.Storage() as store:
+        rows = store.read_verdicts(statuses)
     if not rows:
         print("(no matching verdicts — run `hermes flaky-detective scan` first)")
         return 0
@@ -356,7 +281,7 @@ def _cmd_install_cron(args) -> int:
     # Validate before persisting/installing anything, so a bad value is never
     # written into config.json nor baked into the scheduled job.
     try:
-        _validate_tunables(window_days, min_fails)
+        domain.validate_tunables(window_days, min_fails)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

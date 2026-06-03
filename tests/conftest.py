@@ -7,10 +7,9 @@ test suite exercises the package exactly as Hermes would, then alias it under a
 valid Python identifier (``hermes_flaky_detective``) so test modules can write
 ``from hermes_flaky_detective import detect``.
 
-Crucially, the alias reuses the *same* module objects, so the module-level
-singletons in ``storage.py`` (the connection and config caches) stay
-single-instance across both the plugin's internal relative imports and the
-tests' aliased imports.
+Crucially, the alias reuses the *same* module objects, so a ``Storage`` (and the
+conn-taking SQL helpers) behave identically whether reached through the plugin's
+internal relative imports or the tests' aliased imports.
 """
 
 import importlib
@@ -55,21 +54,27 @@ from hermes_flaky_detective import storage  # noqa: E402  (after bootstrap)
 
 @pytest.fixture
 def profile_env(tmp_path, monkeypatch):
-    """Isolate HERMES_HOME under a tmp dir and reset storage singletons.
+    """Isolate HERMES_HOME under a tmp dir so the profile-aware home is a sandbox.
 
     Monkeypatch ``Path.home`` and ``HERMES_HOME`` so the plugin's profile-aware
-    home resolves inside the tmp dir, never the real one.
+    home resolves inside the tmp dir, never the real one. No singleton to reset:
+    each test gets a fresh home (hence a fresh verdicts DB), and every ``Storage``
+    owns and closes its own connection.
     """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    storage.reset_for_tests()
     yield home
-    storage.reset_for_tests()
 
 
 @pytest.fixture
 def verdicts_db(profile_env):
-    """An empty verdicts database with the schema applied, ready for writes."""
-    return storage.get_connection()
+    """An open verdicts-DB connection (schema applied); closed on teardown.
+
+    Yields the raw connection so the conn-taking storage helpers can be exercised
+    directly; the owning ``Storage`` closes it when the test finishes.
+    """
+    store = storage.Storage()
+    yield store.conn
+    store.close()

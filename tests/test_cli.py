@@ -71,13 +71,13 @@ def test_scan_detects_flaky_end_to_end(profile_env, capsys):
     out = capsys.readouterr().out
     assert "test_flaky" in out
     assert "1 flaky" in out
-    # persisted
-    conn = storage.get_connection()
-    v = storage.get_verdict(conn, "pkg.Mod::test_flaky")
-    assert v is not None and v["status"] == domain.VERDICT_FLAKY
-    assert storage.get_verdict(conn, "pkg.Mod::test_stable")["status"] == domain.VERDICT_STABLE
-    # a scan_runs row was recorded
-    assert storage.last_scan_run(conn)["flaky_found"] == 1
+    # persisted — re-open the verdicts DB the CLI wrote and closed
+    with storage.Storage() as store:
+        v = store.get_verdict("pkg.Mod::test_flaky")
+        assert v is not None and v["status"] == domain.VERDICT_FLAKY
+        assert store.get_verdict("pkg.Mod::test_stable")["status"] == domain.VERDICT_STABLE
+        # a scan_runs row was recorded
+        assert store.last_scan_run()["flaky_found"] == 1
 
 
 def test_scan_json_format(profile_env, capsys):
@@ -179,8 +179,8 @@ def test_scan_empty_window_preserves_previous_verdicts(profile_env, capsys):
     assert _run(["scan", "--format", "human"]) == 0
     assert "keeping the previous verdicts" in capsys.readouterr().out
     # The earlier flaky verdict survives the empty scan (not overwritten).
-    conn = storage.get_connection()
-    assert storage.get_verdict(conn, "pkg.Mod::test_flaky")["status"] == domain.VERDICT_FLAKY
+    with storage.Storage() as store:
+        assert store.get_verdict("pkg.Mod::test_flaky")["status"] == domain.VERDICT_FLAKY
 
 
 # ---------------------------------------------------------------------------

@@ -84,36 +84,14 @@ def _validate_test_id(value) -> str:
     return cleaned
 
 
-def _resolve_candidates(conn, test_id):
-    """Verdict rows matching ``test_id``, worst-first (most failures first).
+def _lookup(store, test_id: str) -> dict:
+    """Shape the ``is_flaky`` result for ``test_id`` from the stored verdicts.
 
-    Resolution order: an exact ``test_key`` (``classname::name``); else, for a
-    ``left::right`` identifier, ``name = right`` with ``classname`` *or*
-    ``file_path`` equal to ``left`` (so ``file_path::name`` works even though the
-    key is built from classname); else a bare ``name`` match. Every value binds
-    through ``?``.
+    Verdict resolution (the SQL) is owned by ``storage.resolve_verdicts``; this
+    function is pure presentation: pick the worst-first top candidate and build
+    the tool's JSON-able dict, or an ``unknown`` verdict when nothing matches.
     """
-    rows = conn.execute(
-        "SELECT * FROM flaky_verdicts WHERE test_key = ? ORDER BY fails DESC, runs DESC",
-        (test_id,),
-    ).fetchall()
-    if rows:
-        return rows
-    if "::" in test_id:
-        left, right = (p.strip() for p in test_id.rsplit("::", 1))
-        return conn.execute(
-            "SELECT * FROM flaky_verdicts WHERE name = ? AND (classname = ? OR file_path = ?) "
-            "ORDER BY fails DESC, runs DESC, test_key ASC",
-            (right, left, left),
-        ).fetchall()
-    return conn.execute(
-        "SELECT * FROM flaky_verdicts WHERE name = ? ORDER BY fails DESC, runs DESC, test_key ASC",
-        (test_id,),
-    ).fetchall()
-
-
-def _lookup(conn, test_id: str) -> dict:
-    candidates = _resolve_candidates(conn, test_id)
+    candidates = store.resolve_verdicts(test_id)
     if not candidates:
         return {
             "test_id": test_id,
@@ -154,8 +132,14 @@ def _error_json(error: str, remediation: str) -> str:
     )
 
 
-def _handle_is_flaky(params, **kwargs):
-    """``is_flaky`` tool handler. Returns a JSON string (the tool contract)."""
+def _handle_is_flaky(params, *, store=None, **kwargs):
+    """``is_flaky`` tool handler. Returns a JSON string (the tool contract).
+
+    ``store`` is the verdicts :class:`storage.Storage` to read. In production it is
+    the long-lived instance injected by :func:`register` (a warm, reused
+    connection for the gateway's worker pool). When called without one, a transient
+    Storage is opened and closed for this single lookup — the path tests exercise.
+    """
     try:
         test_id = _validate_test_id(params.get("test_id"))
     except ValueError as exc:
@@ -163,21 +147,23 @@ def _handle_is_flaky(params, **kwargs):
 
     from . import storage
 
+    owned = store is None
+    if owned:
+        store = storage.Storage()
     try:
-        conn = storage.get_connection()
-    except Exception:  # noqa: BLE001 — setup failure: server-side, not the model's
-        logger.exception("is_flaky: could not open the verdicts database")
-        return _error_json(_INTERNAL_ERROR, _REMEDIATION)
-
-    try:
-        result = _lookup(conn, test_id)
+        result = _lookup(store, test_id)
         return json.dumps(
             {"success": True, "content_warning": _CONTENT_NOTICE, **result},
             ensure_ascii=False,
         )
     except Exception:  # noqa: BLE001 — log internally, return a generic message
+        # Covers both a failed connection open (lazy, on first query) and any
+        # lookup error; both are server-side, not the model's to fix.
         logger.exception("is_flaky failed")
         return _error_json(_INTERNAL_ERROR, _REMEDIATION)
+    finally:
+        if owned:
+            store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +174,22 @@ def _handle_is_flaky(params, **kwargs):
 def register(ctx) -> None:
     """Wire the ``is_flaky`` tool and the ``flaky-detective`` CLI command."""
     from . import cli as cli_module
+    from . import storage
+
+    # One long-lived Storage for the tool path, owned by this registration rather
+    # than a module global. Constructing it does no I/O (the connection opens
+    # lazily on the first is_flaky call), so registration/startup stay cheap; the
+    # warm connection is then reused across calls.
+    store = storage.Storage()
+
+    def is_flaky_handler(params, **kwargs):
+        return _handle_is_flaky(params, store=store, **kwargs)
 
     ctx.register_tool(
         "is_flaky",
         "flaky_detective",
         IS_FLAKY_SCHEMA,
-        _handle_is_flaky,
+        is_flaky_handler,
         description="Check whether a test is known to be flaky, with pass/fail counts.",
     )
     ctx.register_cli_command(
