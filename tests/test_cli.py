@@ -201,6 +201,24 @@ def test_scan_cron_silent_when_test_history_missing(profile_env, capsys):
     assert "not found" in captured.err      # note still on stderr
 
 
+def test_scan_internal_error_is_clean_not_a_traceback(profile_env, capsys, monkeypatch):
+    # An unexpected failure inside the use case (here, a SQLite error) must surface as
+    # a one-line error + non-zero exit, not an uncaught traceback. The cron shim turns
+    # the non-zero exit into an alert, so the sweep still fails loudly.
+    import sqlite3
+
+    from hermes_flaky_detective import scan
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(scan, "run_scan", boom)
+    assert _run(["scan", "--format", "human"]) == 1
+    err = capsys.readouterr().err
+    assert "scan failed" in err
+    assert "Traceback" not in err
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------

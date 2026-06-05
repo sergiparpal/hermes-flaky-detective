@@ -85,6 +85,13 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
     order: list[str] = []
 
     for classname, name, file_path, status, eff_ts in rows:
+        # Normalize identity up front so the stored classname/name columns match the
+        # test_key, which make_test_key builds from *stripped* values. Otherwise a
+        # name with surrounding whitespace would key as "cls::name" yet store the raw
+        # " name ", and the is_flaky bare-name / file_path::name lookups (which match
+        # the name column) would miss it. None is preserved (jest omits classname).
+        classname = classname.strip() if isinstance(classname, str) else classname
+        name = name.strip() if isinstance(name, str) else name
         key = domain.make_test_key(classname, name)
         agg = acc.get(key)
         if agg is None:

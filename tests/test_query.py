@@ -151,7 +151,79 @@ def test_fallback_matches_window_function_path(tmp_path):
         fallback = query._fallback_read(conn, CUTOFF)
     finally:
         conn.close()
-    assert sorted(primary) == sorted(fallback)
+    # Both paths agree on *order*, not just contents — each applies a deterministic
+    # ORDER BY (eff_ts, then case insertion order), so the core sees identical input.
+    assert primary == fallback
+
+
+def test_window_path_orders_rows_by_effective_time(tmp_path):
+    # Runs inserted out of chronological order must come back ordered by eff_ts, so
+    # the core's output order (and file_path backfill) is deterministic, not join-order.
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "c.xml", "run_timestamp": "2026-05-24T09:00:00",
+         "cases": [{"name": "t3", "status": "failed"}]},
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t1", "status": "failed"}]},
+        {"source_file": "b.xml", "run_timestamp": "2026-05-22T09:00:00",
+         "cases": [{"name": "t2", "status": "failed"}]},
+    ])
+    eff = [r[4] for r in _read(db).rows]
+    assert eff == sorted(eff)
+
+
+# ---------------------------------------------------------------------------
+# Reingest dedup needs a run_timestamp — warn when it cannot be applied
+# ---------------------------------------------------------------------------
+
+
+def test_warns_when_timestampless_runs_cannot_be_deduped(tmp_path, caplog):
+    # Same source_file ingested twice with NO run_timestamp: the dedup key falls back
+    # to ingested_at (unique per ingest), so the two ingests cannot be collapsed and
+    # test_x is counted twice. The reader must warn so this is not silent.
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "ci/junit.xml", "run_timestamp": None, "ingested_at": "2026-05-20 09:05:00",
+         "cases": [{"name": "test_x", "status": "failed"}]},
+        {"source_file": "ci/junit.xml", "run_timestamp": None, "ingested_at": "2026-05-20 10:00:00",
+         "cases": [{"name": "test_x", "status": "failed"}]},
+    ])
+    with caplog.at_level("WARNING"):
+        rows = _read(db).rows
+    assert len(rows) == 2                                   # not deduped (the inherent limit)
+    assert any("run_timestamp" in rec.message for rec in caplog.records)
+
+
+def test_no_undedupable_warning_when_runs_have_timestamps(tmp_path, caplog):
+    # A single timestamp-less run, and distinct timestamped runs, must NOT warn.
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": None, "ingested_at": "2026-05-20 09:00:00",
+         "cases": [{"name": "t1", "status": "failed"}]},
+        {"source_file": "b.xml", "run_timestamp": "2026-05-21T09:00:00",
+         "cases": [{"name": "t2", "status": "failed"}]},
+        {"source_file": "b.xml", "run_timestamp": "2026-05-22T09:00:00",
+         "cases": [{"name": "t2", "status": "failed"}]},
+    ])
+    with caplog.at_level("WARNING"):
+        _read(db)
+    assert not any("run_timestamp" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Row normalization is type-safe (a non-string eff_ts must not crash the core)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_rows_coerces_non_string_eff_ts(tmp_path):
+    from hermes_flaky_detective import detect
+
+    # A numeric/epoch eff_ts mixed with a string one previously made the core compare
+    # str vs int -> TypeError. Normalization must yield only strings (or None).
+    raw = [("c", "n", "f", "passed", 1716192000),
+           ("c", "n", "f", "failed", "2026-05-20T09:00:00")]
+    normalized = query._normalize_rows(raw)
+    assert all(isinstance(r[4], str) for r in normalized)
+    # And the pure core consumes the result without raising.
+    verdicts = detect.compute_verdicts(normalized, None, 14, 1, True)
+    assert verdicts[0].runs == 2
 
 
 # ---------------------------------------------------------------------------

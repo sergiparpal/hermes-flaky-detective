@@ -227,3 +227,21 @@ def test_multiple_tests_distinct_verdicts_and_order():
 
 def test_empty_input_yields_no_verdicts():
     assert detect.compute_verdicts([], NOW, 14, 3, True) == []
+
+
+def test_classname_and_name_are_stripped_to_match_test_key():
+    # A name/classname with surrounding whitespace must be stored stripped, so the
+    # stored columns agree with test_key (built from stripped values). Otherwise the
+    # is_flaky bare-name / file_path::name lookups (which match the name column) miss.
+    rows = [
+        ("  pkg.Mod  ", "  test_a  ", "src/mod.py", "failed", "2026-05-20T09:00:00"),
+        ("  pkg.Mod  ", "  test_a  ", "src/mod.py", "failed", "2026-05-21T09:00:00"),
+        ("  pkg.Mod  ", "  test_a  ", "src/mod.py", "failed", "2026-05-22T09:00:00"),
+        ("  pkg.Mod  ", "  test_a  ", "src/mod.py", "passed", "2026-05-23T09:00:00"),
+    ]
+    out = detect.compute_verdicts(rows, NOW, 14, 3, True)
+    assert len(out) == 1
+    v = out[0]
+    assert v.test_key == "pkg.Mod::test_a"
+    assert v.classname == "pkg.Mod"      # stored value matches the key, not " pkg.Mod "
+    assert v.name == "test_a"

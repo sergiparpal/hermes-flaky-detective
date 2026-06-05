@@ -140,6 +140,11 @@ def _handle_is_flaky(params, *, store=None, **kwargs):
     connection for the gateway's worker pool). When called without one, a transient
     Storage is opened and closed for this single lookup — the path tests exercise.
     """
+    # The tool contract is "always return a JSON string", so a non-dict params
+    # (e.g. None) must become an error response, not an AttributeError on .get().
+    if not isinstance(params, dict):
+        return _error_json("`params` must be a JSON object with a `test_id`",
+                           _INPUT_REMEDIATION)
     try:
         test_id = _validate_test_id(params.get("test_id"))
     except ValueError as exc:

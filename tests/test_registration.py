@@ -134,6 +134,15 @@ def test_handler_bad_input(profile_env):
         assert "error" in payload and "remediation" in payload
 
 
+def test_handler_non_dict_params_returns_error_json(profile_env):
+    # The contract is "always return a JSON string"; a non-dict params (e.g. None)
+    # must become an error response, not raise AttributeError on params.get().
+    for bad in (None, "test_a", 42, ["test_a"]):
+        payload = json.loads(_handle_is_flaky(bad))
+        assert payload["success"] is False
+        assert "error" in payload and "remediation" in payload
+
+
 def test_handler_returns_json_string(profile_env):
     # No store passed: the handler opens (and closes) a transient Storage itself.
     assert isinstance(_handle_is_flaky({"test_id": "x"}), str)

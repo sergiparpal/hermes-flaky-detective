@@ -7,6 +7,7 @@ temp HERMES_HOME.
 
 import argparse
 import os
+import shlex
 import stat
 from types import SimpleNamespace
 
@@ -47,6 +48,17 @@ def test_persists_resolved_options(profile_env, capsys):
     assert cfg["deliver"] == "slack"
     assert cfg["window_days"] == 7
     assert cfg["min_fails"] == 2
+
+
+def test_printable_command_shell_quotes_arguments():
+    # A schedule/deliver with spaces must stay single shell tokens in the printed
+    # copy-paste command, so it round-trips through a shell parser intact.
+    printable = cli._printable_cron_command("*/5 9 * * *", "my channel")
+    tokens = shlex.split(printable)
+    assert "*/5 9 * * *" in tokens          # the whole cron expr is one argument
+    assert "my channel" in tokens           # the delivery channel is one argument
+    assert tokens[:3] == ["hermes", "cron", "create"]
+    assert tokens[-2:] == ["--name", cli.CRON_JOB_NAME]
 
 
 def test_rejects_nonpositive_min_fails_without_persisting(profile_env, capsys):

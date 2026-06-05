@@ -11,10 +11,14 @@ paths + last scan), ``list`` (the stored verdicts), and ``install-cron`` (Phase 
 
 import argparse
 import json
+import logging
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,13 @@ def _cmd_scan(args) -> int:
         except ValueError as exc:   # invalid tunables — rejected before any read
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        except Exception as exc:    # any other failure (e.g. a SQLite error): emit a
+            # clean one-line error and a non-zero exit rather than dumping a traceback.
+            # The cron shim turns a non-zero exit into an alert, so the sweep still
+            # fails loudly — just without the noise. Detail is logged server-side.
+            logger.exception("flaky-detective scan failed")
+            print(f"error: flaky-detective scan failed: {exc}", file=sys.stderr)
+            return 1
         return _emit_scan(outcome, fmt, report_scope)
 
 
@@ -223,8 +234,12 @@ CRON_JOB_NAME = "flaky-detective"
 
 
 def _printable_cron_command(schedule: str, deliver: str) -> str:
-    return (f'hermes cron create "{schedule}" --no-agent --script {SHIM_NAME} '
-            f'--deliver {deliver} --name {CRON_JOB_NAME}')
+    # shlex.quote the user-supplied parts so the printed copy-paste command stays a
+    # single valid shell command even if a schedule or delivery channel contains
+    # spaces or other shell metacharacters. (The real job creation uses argv, so it
+    # was never injectable; this only hardens the human-facing fallback string.)
+    return (f'hermes cron create {shlex.quote(schedule)} --no-agent --script {SHIM_NAME} '
+            f'--deliver {shlex.quote(deliver)} --name {CRON_JOB_NAME}')
 
 
 def _gateway_note() -> str:

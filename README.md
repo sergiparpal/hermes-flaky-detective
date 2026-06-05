@@ -173,6 +173,15 @@ test-history v0.1.0: re-ingesting the same file creates a new run, so this plugi
 emitters (e.g. jest) omit `file_path`, so tests are identified by
 `classname::name` (path-based filtering will miss those).
 
+**Dedup needs a `run_timestamp`.** Because the dedup key falls back to
+`ingested_at` when a run has no `run_timestamp`, two ingests of the same
+timestamp-less artifact look like two distinct runs and **cannot** be collapsed —
+their cases are counted once per ingest, which can inflate a test's fail count.
+When this is detected (an in-window `source_file` with more than one
+timestamp-less run) the scan logs a one-line warning to stderr; fix it by ensuring
+your JUnit XML carries a suite `timestamp`, or by pruning the duplicate runs in
+test-history.
+
 ### GPL / data-only boundary
 
 `hermes-test-history` is **GPL-3.0**. This plugin only reads its SQLite **data

@@ -66,7 +66,11 @@ _WINDOW_SQL = (
     "SELECT c.classname, c.name, c.file_path, c.status, lr.eff_ts "
     "FROM test_cases c "
     "JOIN logical_runs lr ON lr.id = c.run_id AND lr.rn = 1 "
-    "WHERE c.status <> '" + _SKIP + "'"
+    "WHERE c.status <> '" + _SKIP + "' "
+    # Deterministic row order (by effective time, then insertion order) so the
+    # core's output order — and which row wins the file_path backfill when a test's
+    # path varies across runs — is stable, not left to SQLite's join order.
+    "ORDER BY lr.eff_ts ASC, c.id ASC"
 )
 
 # Fallback runs query (no window function): ordered so the first row seen for a
@@ -81,7 +85,8 @@ _FALLBACK_CASES_SQL = (
     "SELECT c.classname, c.name, c.file_path, c.status, c.run_id "
     "FROM test_cases c JOIN test_runs tr ON tr.id = c.run_id "
     "WHERE c.status <> '" + _SKIP + "' "
-    "  AND datetime(" + domain.effective_time("tr.") + ") >= datetime(?)"
+    "  AND datetime(" + domain.effective_time("tr.") + ") >= datetime(?) "
+    "ORDER BY c.id ASC"
 )
 
 
@@ -128,6 +133,42 @@ def _warn_on_schema_mismatch(version: int | None) -> None:
         )
 
 
+def _warn_on_undedupable_runs(conn: sqlite3.Connection, cutoff: str) -> None:
+    """Warn when reingest dedup cannot collapse some in-window runs (best-effort).
+
+    Dedup keys on ``(source_file, COALESCE(run_timestamp, ingested_at))``. When a
+    run has **no ``run_timestamp``** the key degrades to ``ingested_at``, which is
+    unique per ingest — so re-ingesting the same timestamp-less artifact is *not*
+    collapsed and its cases are counted once per ingest, which can inflate a test's
+    fail count past ``min_fails`` and misclassify it. We cannot distinguish a
+    re-ingest from a genuinely distinct run without a ``run_timestamp``, so this is
+    surfaced as a caution (never a failure): if any in-window ``source_file`` has
+    more than one run lacking a ``run_timestamp``, warn so the operator can re-ingest
+    with a timestamp or prune duplicates. Wrapped in a tolerant ``try`` so a
+    malformed source DB still reaches the clean error raised by the windowed read.
+    """
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT 1 FROM test_runs"
+            "  WHERE run_timestamp IS NULL AND datetime(ingested_at) >= datetime(?)"
+            "  GROUP BY source_file HAVING COUNT(*) > 1"
+            ")",
+            (cutoff,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return
+    affected = int(row[0]) if row and row[0] is not None else 0
+    if affected:
+        logger.warning(
+            "%s source file(s) have multiple in-window runs with no run_timestamp; "
+            "reingest dedup keys on run_timestamp and cannot collapse these, so their "
+            "tests' pass/fail counts may be inflated by duplicate ingests. Re-ingest "
+            "with a run timestamp, or prune the duplicate runs in hermes-test-history.",
+            affected,
+        )
+
+
 def _normalize_rows(raw_rows) -> list[tuple]:
     """Canonicalize each row's eff_ts so the pure core can compare as strings.
 
@@ -143,7 +184,14 @@ def _normalize_rows(raw_rows) -> list[tuple]:
         if eff_ts in cache:
             ts = cache[eff_ts]
         else:
-            ts = timeutil.normalize_ts(eff_ts) or eff_ts
+            ts = timeutil.normalize_ts(eff_ts)
+            if ts is None:
+                # Unparseable or non-string eff_ts (e.g. a numeric/epoch timestamp
+                # from a malformed source DB): keep a *string* form so the pure core
+                # only ever compares str-to-str and never raises a TypeError on a
+                # mixed-type row. eff_ts is never NULL (it is a COALESCE of two
+                # columns, one NOT NULL), but guard it anyway.
+                ts = str(eff_ts) if eff_ts is not None else None
             cache[eff_ts] = ts
         out.append((classname, name, file_path, status, ts))
     return out
@@ -172,6 +220,10 @@ def _fallback_read(conn: sqlite3.Connection, cutoff: str) -> list[tuple]:
     ):
         if run_id in survivor_ids:
             raw.append((classname, name, file_path, status, eff_by_run[run_id]))
+    # Match the window-function path's ORDER BY (eff_ts, then case insertion order).
+    # The cases query already yields rows in c.id order; a stable sort on eff_ts
+    # promotes that to (eff_ts ASC, c.id ASC) so both read paths agree byte-for-byte.
+    raw.sort(key=lambda r: r[4])
     return _normalize_rows(raw)
 
 
@@ -215,6 +267,7 @@ def read_test_history(db_path, cutoff: str) -> ReadResult:
         conn.row_factory = sqlite3.Row
         version = read_source_schema_version(conn)
         _warn_on_schema_mismatch(version)
+        _warn_on_undedupable_runs(conn, cutoff)
         try:
             rows = _read_windowed(conn, cutoff)
         except sqlite3.DatabaseError as exc:
